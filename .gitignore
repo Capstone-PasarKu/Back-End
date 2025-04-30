@@ -1,0 +1,9 @@
+# File kredensial Firebase
+pasarku-firebase-adminsdk.json
+
+# File lingkungan (environment variables)
+.env
+
+# Folder dependensi Node.js (akan diinstall ulang saat deploy)
+node_modules/
+.vercel
