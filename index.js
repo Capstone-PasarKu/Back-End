@@ -8,6 +8,21 @@ const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
+
+// CORS Middleware - TAMBAHKAN INI
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  
+  // Handle preflight requests
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(200);
+  } else {
+    next();
+  }
+});
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -56,12 +71,12 @@ app.get('/', (req, res) => {
   res.json({ message: 'API is running' });
 });
 
-// Register User
+// Register User (Updated with name, address, phoneNumber)
 app.post('/api/register', upload.none(), async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, name, address, phoneNumber } = req.body;
   try {
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email dan password wajib' });
+    if (!email || !password || !name || !address || !phoneNumber) {
+      return res.status(400).json({ error: 'Email, password, nama, alamat, dan nomor telepon wajib' });
     }
     const userRecord = await auth.createUser({
       email,
@@ -69,6 +84,9 @@ app.post('/api/register', upload.none(), async (req, res) => {
     });
     await db.collection('users').doc(userRecord.uid).set({
       email,
+      name,
+      address,
+      phoneNumber,
       role: 'user',
       createdAt: new Date().toISOString(),
     });
@@ -93,13 +111,188 @@ app.post('/api/login', upload.none(), async (req, res) => {
   }
 });
 
+// Tambah ke Keranjang
+app.post('/api/cart', verifyToken, upload.none(), async (req, res) => {
+  const { merchantId, itemId, quantity } = req.body;
+  try {
+    if (!merchantId || !itemId || !quantity) {
+      return res.status(400).json({ error: 'merchantId, itemId, dan quantity wajib' });
+    }
+    const quantityNum = parseInt(quantity);
+    if (isNaN(quantityNum) || quantityNum <= 0) {
+      return res.status(400).json({ error: 'Quantity harus berupa angka positif' });
+    }
+
+    const itemDoc = await db.collection('items').doc(itemId).get();
+    if (!itemDoc.exists || itemDoc.data().merchantId !== merchantId) {
+      return res.status(404).json({ error: 'Barang tidak ditemukan atau tidak terkait dengan merchant' });
+    }
+
+    const stockDoc = await db.collection('stocks').doc(itemId).get();
+    if (!stockDoc.exists || stockDoc.data().quantity < quantityNum) {
+      return res.status(400).json({ error: 'Stok tidak cukup' });
+    }
+
+    const cartRef = db.collection('carts').doc();
+    await cartRef.set({
+      userId: req.user.uid,
+      merchantId,
+      itemId,
+      quantity: quantityNum,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    res.json({ message: 'Barang berhasil ditambahkan ke keranjang', id: cartRef.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+// Ambil Daftar Keranjang User
+app.get('/api/cart', verifyToken, async (req, res) => {
+  try {
+    const snapshot = await db.collection('carts')
+      .where('userId', '==', req.user.uid)
+      .get();
+    
+    const cartItems = await Promise.all(
+      snapshot.docs.map(async doc => {
+        const cartData = doc.data();
+        const itemDoc = await db.collection('items').doc(cartData.itemId).get();
+        const itemData = itemDoc.exists ? itemDoc.data() : {};
+        const merchantDoc = await db.collection('merchants').doc(cartData.merchantId).get();
+        const merchantData = merchantDoc.exists ? merchantDoc.data() : {};
+        return {
+          id: doc.id,
+          ...cartData,
+          item: itemData,
+          merchant: merchantData,
+        };
+      })
+    );
+
+    res.json(cartItems);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update Item di Keranjang
+app.put('/api/cart/:id', verifyToken, upload.none(), async (req, res) => {
+  const { id } = req.params;
+  let { merchantId, itemId, quantity } = req.body; // Menggunakan let untuk memungkinkan perubahan jika perlu
+  try {
+    // Validasi input
+    if (!quantity) {
+      return res.status(400).json({ error: 'Quantity wajib diisi' });
+    }
+    const quantityNum = parseInt(quantity);
+    if (isNaN(quantityNum) || quantityNum <= 0) {
+      return res.status(400).json({ error: 'Quantity harus berupa angka positif' });
+    }
+
+    const cartRef = db.collection('carts').doc(id);
+    const cartDoc = await cartRef.get();
+    if (!cartDoc.exists) {
+      return res.status(404).json({ error: 'Item keranjang tidak ditemukan' });
+    }
+    if (cartDoc.data().userId !== req.user.uid) {
+      return res.status(403).json({ error: 'Anda tidak memiliki akses untuk mengedit item ini' });
+    }
+
+    // Validasi item dan merchant (opsional, hanya jika ada perubahan)
+    if (itemId && cartDoc.data().itemId !== itemId) {
+      const itemDoc = await db.collection('items').doc(itemId).get();
+      if (!itemDoc.exists || itemDoc.data().merchantId !== (merchantId || cartDoc.data().merchantId)) {
+        return res.status(404).json({ error: 'Barang tidak ditemukan atau tidak terkait dengan merchant' });
+      }
+    } else {
+      itemId = cartDoc.data().itemId; // Menggunakan let memungkinkan perubahan ini
+    }
+
+    if (merchantId && cartDoc.data().merchantId !== merchantId) {
+      const itemDoc = await db.collection('items').doc(cartDoc.data().itemId).get();
+      if (!itemDoc.exists || itemDoc.data().merchantId !== merchantId) {
+        return res.status(400).json({ error: 'Merchant tidak sesuai dengan barang' });
+      }
+    } else {
+      merchantId = cartDoc.data().merchantId; // Menggunakan let memungkinkan perubahan ini
+    }
+
+    // Validasi stok
+    const stockDoc = await db.collection('stocks').doc(itemId).get();
+    if (!stockDoc.exists || stockDoc.data().quantity < quantityNum) {
+      return res.status(400).json({ error: 'Stok tidak cukup' });
+    }
+
+    // Update data cart
+    await cartRef.update({
+      quantity: quantityNum,
+      merchantId,
+      itemId,
+      updatedAt: new Date().toISOString(),
+    });
+
+    res.json({ message: 'Item keranjang berhasil diperbarui', id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Hapus Item dari Keranjang
+app.delete('/api/cart/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const cartRef = db.collection('carts').doc(id);
+    const cartDoc = await cartRef.get();
+    if (!cartDoc.exists) {
+      return res.status(404).json({ error: 'Item keranjang tidak ditemukan' });
+    }
+    if (cartDoc.data().userId !== req.user.uid) {
+      return res.status(403).json({ error: 'Anda tidak memiliki akses untuk menghapus item ini' });
+    }
+
+    await cartRef.delete();
+    res.json({ message: 'Item keranjang berhasil dihapus', id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+// Ambil Profil User
+app.get('/api/profile', verifyToken, async (req, res) => {
+  try {
+    const userDoc = await db.collection('users').doc(req.user.uid).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'Profil user tidak ditemukan' });
+    }
+    const userData = userDoc.data();
+    res.json({
+      uid: req.user.uid,
+      email: userData.email,
+      name: userData.name,
+      address: userData.address,
+      phoneNumber: userData.phoneNumber,
+      role: userData.role,
+      createdAt: userData.createdAt,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
 // Tambah Pedagang
 app.post('/api/merchant', verifyToken, upload.single('photo'), async (req, res) => {
-  const { name, category, lat, lng } = req.body;
+  const { name, category, lat, lng, norek } = req.body;
   try {
     if (!name || !category || !lat || !lng) {
       return res.status(400).json({ error: 'Nama, kategori, dan lokasi wajib' });
     }
+    
     let photoUrl = '';
     if (req.file) {
       const result = await new Promise((resolve, reject) => {
@@ -110,14 +303,17 @@ app.post('/api/merchant', verifyToken, upload.single('photo'), async (req, res) 
       });
       photoUrl = result.secure_url;
     }
+    
     const merchantRef = await db.collection('merchants').add({
       name,
       category,
       location: { lat: parseFloat(lat), lng: parseFloat(lng) },
       photoUrl,
+      norek: norek || '', // Nomor rekening (opsional)
       createdAt: new Date().toISOString(),
       userId: req.user.uid,
     });
+    
     res.json({ message: 'Toko Berhasil Ditambahkan', id: merchantRef.id });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -163,8 +359,8 @@ app.get('/api/merchants', async (req, res) => {
   }
 });
 
-// Tambah Barang (dengan stok awal)
-app.post('/api/item', verifyToken, upload.none(), async (req, res) => {
+// Tambah Barang (dengan stok awal dan gambar opsional)
+app.post('/api/item', verifyToken, upload.single('photo'), async (req, res) => {
   const { merchantId, name, category, basePrice, quantity } = req.body;
   try {
     if (!merchantId || !name || !category || !basePrice || !quantity) {
@@ -178,11 +374,23 @@ app.post('/api/item', verifyToken, upload.none(), async (req, res) => {
     if (!merchantDoc.exists || merchantDoc.data().userId !== req.user.uid) {
       return res.status(403).json({ error: 'Merchant tidak ditemukan atau bukan milik Anda' });
     }
+    let photoUrl = '';
+    if (req.file) {
+      const result = await new Promise((resolve, reject) => {
+        cloudinary.uploader.upload_stream({ folder: 'pasarku/items' }, (error, result) => {
+          if (error) return reject(error);
+          resolve(result);
+        }).end(req.file.buffer);
+      });
+      photoUrl = result.secure_url;
+    }
     const itemRef = await db.collection('items').add({
       merchantId,
       name,
       category,
       basePrice: parseFloat(basePrice),
+      photoUrl,
+      quantity: initialQuantity,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       userId: req.user.uid,
@@ -200,8 +408,8 @@ app.post('/api/item', verifyToken, upload.none(), async (req, res) => {
   }
 });
 
-// Update Barang
-app.put('/api/item/:id', verifyToken, upload.none(), async (req, res) => {
+// Update Barang (dengan dukungan update gambar)
+app.put('/api/item/:id', verifyToken, upload.single('photo'), async (req, res) => {
   const { id } = req.params;
   const { name, category, basePrice } = req.body;
   try {
@@ -216,12 +424,27 @@ app.put('/api/item/:id', verifyToken, upload.none(), async (req, res) => {
     if (itemDoc.data().userId !== req.user.uid) {
       return res.status(403).json({ error: 'Anda tidak memiliki akses untuk mengedit barang ini' });
     }
-    await itemRef.update({
+
+    // Prepare update data
+    const updateData = {
       name,
       category,
       basePrice: parseFloat(basePrice),
       updatedAt: new Date().toISOString(),
-    });
+    };
+
+    // Handle photo upload if provided
+    if (req.file) {
+      const result = await new Promise((resolve, reject) => {
+        cloudinary.uploader.upload_stream({ folder: 'pasarku/items' }, (error, result) => {
+          if (error) return reject(error);
+          resolve(result);
+        }).end(req.file.buffer);
+      });
+      updateData.photoUrl = result.secure_url;
+    }
+
+    await itemRef.update(updateData);
     res.json({ message: 'Barang berhasil diperbarui' });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -419,9 +642,10 @@ app.get('/api/product/search', async (req, res) => {
 });
 
 // Melakukan Pemesanan
-app.post('/api/order', verifyToken, upload.none(), async (req, res) => {
+app.post('/api/order', verifyToken, upload.single('paymentProof'), async (req, res) => {
   const { merchantId, itemId, quantity, deliveryMethod, paymentMethod, address } = req.body;
   try {
+    // Validasi input
     if (!merchantId || !itemId || !quantity || !deliveryMethod || !paymentMethod) {
       return res.status(400).json({ error: 'Data pemesanan tidak lengkap' });
     }
@@ -434,6 +658,11 @@ app.post('/api/order', verifyToken, upload.none(), async (req, res) => {
     if (deliveryMethod === 'delivery' && !address) {
       return res.status(400).json({ error: 'Alamat wajib untuk pengiriman delivery' });
     }
+    if (paymentMethod === 'digital' && !req.file) {
+      return res.status(400).json({ error: 'Bukti pembayaran wajib untuk metode digital' });
+    }
+
+    // Validasi stok
     const stockRef = db.collection('stocks').doc(itemId);
     const stockDoc = await stockRef.get();
     if (!stockDoc.exists) {
@@ -444,13 +673,32 @@ app.post('/api/order', verifyToken, upload.none(), async (req, res) => {
       return res.status(400).json({ error: 'Stok tidak cukup' });
     }
 
+    // Validasi item
     const itemDoc = await db.collection('items').doc(itemId).get();
     if (!itemDoc.exists) {
       return res.status(404).json({ error: 'Item tidak ditemukan' });
     }
     const itemData = itemDoc.data();
 
+    // Hitung total
     const total = parseInt(quantity) * itemData.basePrice;
+
+    // Upload bukti pembayaran jika ada
+    let paymentProofUrl = '';
+    if (req.file) {
+      const result = await new Promise((resolve, reject) => {
+        cloudinary.uploader.upload_stream(
+          { folder: `pasarku/payment-proofs/${req.user.uid}` },
+          (error, result) => {
+            if (error) return reject(error);
+            resolve(result);
+          }
+        ).end(req.file.buffer);
+      });
+      paymentProofUrl = result.secure_url;
+    }
+
+    // Simpan pesanan
     const orderRef = await db.collection('orders').add({
       userId: req.user.uid,
       merchantId,
@@ -461,12 +709,14 @@ app.post('/api/order', verifyToken, upload.none(), async (req, res) => {
       total,
       deliveryMethod,
       paymentMethod,
-      status: 'pending',
+      paymentProof: paymentProofUrl,
+      status: 'konfirmasi pembayaran',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       address: deliveryMethod === 'delivery' ? address : null,
     });
 
+    // Update stok
     await stockRef.update({
       quantity: stockData.quantity - parseInt(quantity),
     });
@@ -580,8 +830,157 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
   }
 });
 
+// Send Message to Store
+app.post('/api/send-message', verifyToken, upload.none(), async (req, res) => {
+  const { storeName, message } = req.body;
+  try {
+    if (!storeName || !message) {
+      return res.status(400).json({ error: 'Nama toko dan pesan wajib' });
+    }
+
+    const merchantDoc = await db.collection('merchants').doc(storeName).get();
+    if (!merchantDoc.exists) {
+      return res.status(404).json({ error: 'Toko tidak ditemukan' });
+    }
+
+    const messageRef = await db.collection('messages').add({
+      userId: req.user.uid,
+      merchantId: storeName,
+      message,
+      createdAt: new Date().toISOString(),
+      status: 'unread',
+    });
+
+    res.json({ message: 'Pesan berhasil dikirim', id: messageRef.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get Messages for Store Dashboard
+app.get('/api/merchant/messages', verifyToken, async (req, res) => {
+  const { merchantId } = req.query;
+  try {
+    if (!merchantId) {
+      return res.status(400).json({ error: 'merchantId wajib' });
+    }
+
+    const merchantDoc = await db.collection('merchants').doc(merchantId).get();
+    if (!merchantDoc.exists || merchantDoc.data().userId !== req.user.uid) {
+      return res.status(403).json({ error: 'Merchant tidak ditemukan atau bukan milik Anda' });
+    }
+
+    const snapshot = await db.collection('messages')
+      .where('merchantId', '==', merchantId)
+      .get();
+
+    const messages = await Promise.all(
+      snapshot.docs.map(async doc => {
+        const messageData = doc.data();
+        const userDoc = await db.collection('users').doc(messageData.userId).get();
+        const userData = userDoc.exists ? userDoc.data() : {};
+        return {
+          id: doc.id,
+          ...messageData,
+          user: {
+            name: userData.name || 'Unknown',
+            email: userData.email || 'N/A',
+          },
+        };
+      })
+    );
+
+    res.json(messages);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Ambil Semua Pesanan (Untuk Owner)
+app.get('/api/owner/orders', verifyToken, async (req, res) => {
+  try {
+    // Cek peran pengguna
+    const userDoc = await db.collection('users').doc(req.user.uid).get();
+    if (!userDoc.exists || userDoc.data().role !== 'owner') {
+      return res.status(403).json({ error: 'Hanya pengguna dengan peran owner yang dapat mengakses data ini' });
+    }
+
+    // Ambil semua pesanan
+    const snapshot = await db.collection('orders').get();
+    const orders = await Promise.all(
+      snapshot.docs.map(async doc => {
+        const orderData = doc.data();
+        // Ambil data merchant (opsional)
+        const merchantDoc = await db.collection('merchants').doc(orderData.merchantId).get();
+        const merchantData = merchantDoc.exists ? merchantDoc.data() : {};
+        // Ambil data user (opsional)
+        const userDoc = await db.collection('users').doc(orderData.userId).get();
+        const userData = userDoc.exists ? userDoc.data() : {};
+        return {
+          id: doc.id,
+          ...orderData,
+          merchant: {
+            name: merchantData.name || 'Unknown',
+            category: merchantData.category || 'N/A',
+          },
+          user: {
+            name: userData.name || 'Unknown',
+            email: userData.email || 'N/A',
+          },
+        };
+      })
+    );
+
+    res.json(orders);
+  } catch (error) {
+    console.error('Error fetching all orders:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update Status Pesanan (Untuk Owner)
+app.patch('/api/owner/order/:id/status', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+  try {
+    // Cek peran pengguna
+    const userDoc = await db.collection('users').doc(req.user.uid).get();
+    if (!userDoc.exists || userDoc.data().role !== 'owner') {
+      return res.status(403).json({ error: 'Hanya pengguna dengan peran owner yang dapat mengubah status pesanan' });
+    }
+
+    // Validasi status
+    if (!status || !['pending', 'shipped', 'completed', 'canceled'].includes(status)) {
+      return res.status(400).json({ error: 'Status tidak valid. Gunakan: pending, shipped, completed, canceled' });
+    }
+
+    // Cek keberadaan pesanan
+    const orderRef = db.collection('orders').doc(id);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Pesanan tidak ditemukan' });
+    }
+
+    // Update status pesanan
+    await orderRef.update({
+      status,
+      updatedAt: new Date().toISOString(),
+    });
+
+    res.json({ message: 'Status pesanan berhasil diperbarui', id });
+  } catch (error) {
+    console.error('Error updating order status:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server jalan di port ${PORT}`));
 
 // Ekspor app untuk Vercel
 module.exports = app;
+
+//deploy perubahan angel
+
+//deploy perubahan angel 2
